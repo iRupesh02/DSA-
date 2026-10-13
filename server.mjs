@@ -8,7 +8,11 @@ const usersDir = path.join(root, 'users');
 const PORT = Number(process.env.PORT) || 8787;
 const ID_RE = /^[0-9]{8,15}_[A-Za-z0-9_-]{1,40}$/;
 
-fs.mkdirSync(usersDir, { recursive: true });
+function ensureUsersDir() {
+  fs.mkdirSync(usersDir, { recursive: true });
+}
+
+ensureUsersDir();
 
 function userPath(id) {
   if (!ID_RE.test(id)) return null;
@@ -24,6 +28,7 @@ function readUser(id) {
 function writeUser(rec) {
   const file = userPath(rec.id);
   if (!file) throw new Error('Invalid account id');
+  ensureUsersDir();
   fs.writeFileSync(file, JSON.stringify(rec, null, 2));
 }
 
@@ -84,6 +89,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (url.pathname === '/api/users' && req.method === 'GET') {
+      ensureUsersDir();
       const users = fs.readdirSync(usersDir)
         .filter((f) => f.endsWith('.json'))
         .map((f) => {
