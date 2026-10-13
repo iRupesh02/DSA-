@@ -1,6 +1,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -103,7 +104,9 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname === '/api/register' && req.method === 'POST') {
       const body = await readBody(req);
-      if (!userPath(body.id) || !body.passwordHash || !body.token) {
+      // token is optional from the client; prefer body.token, then x-token header, otherwise generate one
+      const token = body.token || req.headers['x-token'] || crypto.randomUUID();
+      if (!userPath(body.id) || !body.passwordHash || !body.mobile || !body.name) {
         send(res, 400, { error: 'Mobile, name, and password are required.' });
         return;
       }
@@ -116,7 +119,7 @@ const server = http.createServer(async (req, res) => {
         mobile: String(body.mobile || ''),
         name: String(body.name || ''),
         passwordHash: body.passwordHash,
-        token: body.token,
+        token: token,
         updatedAt: new Date().toISOString(),
         progress: body.progress || {},
       };
@@ -132,8 +135,9 @@ const server = http.createServer(async (req, res) => {
         send(res, 401, { error: 'Mobile, name, or password does not match a saved account.' });
         return;
       }
-      rec.token = body.token || rec.token;
-      rec.updatedAt = rec.updatedAt || new Date().toISOString();
+      rec.token = body.token || req.headers['x-token'] || rec.token;
+      // update last-seen time on successful login
+      rec.updatedAt = new Date().toISOString();
       writeUser(rec);
       send(res, 200, { ...publicUser(rec), token: rec.token, progress: rec.progress || {} });
       return;
@@ -177,7 +181,9 @@ const server = http.createServer(async (req, res) => {
         send(res, 404, { error: 'Not found' });
         return;
       }
-      const file = path.join(root, rel);
+      // Ensure we join paths correctly even when rel starts with a leading slash
+      const relPath = rel.startsWith('/') ? rel.slice(1) : rel;
+      const file = path.join(root, relPath);
       if (!file.startsWith(root) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
         send(res, 404, { error: 'Not found' });
         return;
