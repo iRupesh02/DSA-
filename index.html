@@ -564,10 +564,13 @@ const DATA = JSON.parse(document.getElementById('DATA').textContent);
 const STORAGE_KEY = 'dsa_tracker_v8_state';
 const SESSION_KEY = 'dsa_tracker_v8_session';
 const ACCOUNTS_KEY = 'dsa_tracker_v8_accounts';
-const API = (location.hostname === '127.0.0.1' || location.hostname === 'localhost') && location.port === '8787'
-  ? ''
-  : 'http://127.0.0.1:8787';
-let serverOk = null;
+const ON_TRACKER = (location.hostname === '127.0.0.1' || location.hostname === 'localhost') && location.port === '8787';
+const API = ON_TRACKER ? '' : 'http://127.0.0.1:8787';
+function canReachSaveServer() {
+  const localHost = location.hostname === '127.0.0.1' || location.hostname === 'localhost' || location.protocol === 'file:';
+  return localHost && location.protocol !== 'https:';
+}
+let serverOk = canReachSaveServer() ? null : false;
 const REV_OFFSETS = DATA.revisionOffsets.slice();
 const WEEKEND_WEIGHT = 2;
 const WEEKDAY_WEIGHT = 1;
@@ -1710,6 +1713,10 @@ function writeLocalAccount(rec) {
   localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(all));
 }
 async function api(path, opts) {
+  if (!canReachSaveServer()) {
+    serverOk = false;
+    throw new Error('Save server is not running. Start it with node server.mjs, then open http://127.0.0.1:8787');
+  }
   let res;
   try {
     res = await fetch(API + path, {
@@ -1747,7 +1754,9 @@ function scheduleUserSync() {
   if (serverOk === false) {
     if (!offlineNoted) {
       offlineNoted = true;
-      showToast('Saved in this browser. Start node server.mjs to write the users folder.', 'err');
+      showToast(location.protocol === 'https:'
+        ? 'Saved in this browser.'
+        : 'Saved in this browser. Start node server.mjs to write the users folder.', location.protocol === 'https:' ? 'ok' : 'err');
     }
     return;
   }
@@ -1916,8 +1925,10 @@ window.__DSA__ = {
 async function boot() {
   await restoreSession();
   lastSavedPayload = progressSnapshot();
-  try { await api('/api/users'); }
-  catch (e) { showToast(e.message, 'err'); }
+  if (canReachSaveServer()) {
+    try { await api('/api/users'); }
+    catch (e) { showToast(e.message, 'err'); }
+  }
   recompute();
   render();
   const loader = $('#bootLoader');
