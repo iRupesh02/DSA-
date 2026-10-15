@@ -2,36 +2,166 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const usersDir = path.join(root, 'users');
 const PORT = Number(process.env.PORT) || 8787;
+const HOST = process.env.HOST || '0.0.0.0';
 const ID_RE = /^[0-9]{8,15}_[A-Za-z0-9_-]{1,40}$/;
+const MAX_BODY = 1024 * 1024;
 
-function ensureUsersDir() {
-  fs.mkdirSync(usersDir, { recursive: true });
+// Storage: a private GitHub repo when GITHUB_TOKEN + GITHUB_REPO are set, otherwise ./users
+const GH_TOKEN = process.env.GITHUB_TOKEN || '';
+const GH_REPO = process.env.GITHUB_REPO || ''; // "owner/repo"
+const GH_BRANCH = process.env.GITHUB_BRANCH || 'main';
+const GH_DIR = process.env.GITHUB_DIR || 'users';
+const FLUSH_MS = Number(process.env.FLUSH_MS) || 5000; // batch progress saves into one commit
+const USE_GITHUB = Boolean(GH_TOKEN && GH_REPO);
+
+const cache = new Map();   // id -> { rec, sha } (sha is the GitHub file version)
+const pending = new Map(); // id -> flush timer
+const writing = new Set();
+
+function validId(id) {
+  return typeof id === 'string' && ID_RE.test(id);
 }
 
-ensureUsersDir();
+/* ---------- local folder storage ---------- */
 
-function userPath(id) {
-  if (!ID_RE.test(id)) return null;
+function localPath(id) {
   return path.join(usersDir, id + '.json');
 }
 
-function readUser(id) {
-  const file = userPath(id);
-  if (!file || !fs.existsSync(file)) return null;
+function localRead(id) {
+  const file = localPath(id);
+  if (!fs.existsSync(file)) return null;
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
-function writeUser(rec) {
-  const file = userPath(rec.id);
-  if (!file) throw new Error('Invalid account id');
-  ensureUsersDir();
-  fs.writeFileSync(file, JSON.stringify(rec, null, 2));
+function localWrite(rec) {
+  fs.mkdirSync(usersDir, { recursive: true });
+  fs.writeFileSync(localPath(rec.id), JSON.stringify(rec, null, 2));
 }
+
+/* ---------- GitHub storage ---------- */
+
+function ghUrl(id) {
+  return 'https://api.github.com/repos/' + GH_REPO + '/contents/' + GH_DIR + '/' + encodeURIComponent(id) + '.json';
+}
+
+async function gh(url, opts) {
+  return fetch(url, {
+    ...opts,
+    headers: {
+      Authorization: 'Bearer ' + GH_TOKEN,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'dsa-tracker',
+      ...(opts && opts.headers),
+    },
+  });
+}
+
+async function ghRead(id) {
+  const res = await gh(ghUrl(id) + '?ref=' + encodeURIComponent(GH_BRANCH));
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error('GitHub read failed (' + res.status + ')');
+  const data = await res.json();
+  const rec = JSON.parse(Buffer.from(data.content, 'base64').toString('utf8'));
+  return { rec, sha: data.sha };
+}
+
+async function ghWrite(entry, retried) {
+  const body = {
+    message: 'Update ' + entry.rec.id,
+    content: Buffer.from(JSON.stringify(entry.rec, null, 2)).toString('base64'),
+    branch: GH_BRANCH,
+  };
+  if (entry.sha) body.sha = entry.sha;
+  const res = await gh(ghUrl(entry.rec.id), { method: 'PUT', body: JSON.stringify(body) });
+  if ((res.status === 409 || res.status === 422) && !retried) {
+    // our copy of the file version is stale; fetch the latest and overwrite with our record
+    const latest = await ghRead(entry.rec.id);
+    entry.sha = latest ? latest.sha : undefined;
+    return ghWrite(entry, true);
+  }
+  if (!res.ok) throw new Error('GitHub write failed (' + res.status + '): ' + (await res.text()).slice(0, 200));
+  const data = await res.json();
+  entry.sha = data.content.sha;
+}
+
+async function flush(id) {
+  clearTimeout(pending.get(id));
+  pending.delete(id);
+  const entry = cache.get(id);
+  if (!entry) return;
+  if (writing.has(id)) { queueFlush(id); return; }
+  writing.add(id);
+  try {
+    await ghWrite(entry);
+  } catch (err) {
+    console.error(err.message);
+    queueFlush(id); // try again later; the record stays in memory
+  } finally {
+    writing.delete(id);
+  }
+}
+
+function queueFlush(id) {
+  if (pending.has(id)) return;
+  pending.set(id, setTimeout(() => flush(id), FLUSH_MS));
+}
+
+/* ---------- storage API used by the routes ---------- */
+
+async function readUser(id) {
+  if (!validId(id)) return null;
+  if (!USE_GITHUB) return localRead(id);
+  if (cache.has(id)) return cache.get(id).rec;
+  const found = await ghRead(id);
+  if (!found) return null;
+  cache.set(id, found);
+  return found.rec;
+}
+
+async function writeUser(rec, { now = false } = {}) {
+  if (!validId(rec.id)) throw new Error('Invalid account id');
+  if (!USE_GITHUB) { localWrite(rec); return; }
+  const entry = cache.get(rec.id) || {};
+  entry.rec = rec;
+  cache.set(rec.id, entry);
+  if (now) await flush(rec.id);
+  else queueFlush(rec.id);
+}
+
+/* ---------- passwords ---------- */
+
+// The browser sends sha256(id:password); it is salted and hashed again here so the
+// stored value cannot be replayed to sign in.
+function hashPassword(clientHash, salt) {
+  return crypto.scryptSync(String(clientHash), salt, 32).toString('hex');
+}
+
+function sameText(a, b) {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+function checkPassword(rec, clientHash) {
+  if (!clientHash || !rec.passwordHash) return false;
+  if (!rec.passwordSalt) return sameText(rec.passwordHash, clientHash); // older unsalted record
+  return sameText(rec.passwordHash, hashPassword(clientHash, rec.passwordSalt));
+}
+
+function setPassword(rec, clientHash) {
+  rec.passwordSalt = crypto.randomBytes(16).toString('hex');
+  rec.passwordHash = hashPassword(clientHash, rec.passwordSalt);
+}
+
+/* ---------- HTTP ---------- */
 
 function publicUser(rec) {
   return {
@@ -46,9 +176,6 @@ function send(res, code, body) {
   const json = JSON.stringify(body);
   res.writeHead(code, {
     'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, x-token',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
     'Content-Length': Buffer.byteLength(json),
   });
   res.end(json);
@@ -57,7 +184,12 @@ function send(res, code, body) {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > MAX_BODY) { reject(new Error('Request too large')); req.destroy(); return; }
+      chunks.push(c);
+    });
     req.on('end', () => {
       if (!chunks.length) return resolve({});
       try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
@@ -67,50 +199,22 @@ function readBody(req) {
   });
 }
 
-const TYPES = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
-  '.svg': 'image/svg+xml',
-};
-
 const server = http.createServer(async (req, res) => {
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Content-Type, x-token',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
-    });
-    res.end();
-    return;
-  }
-
   const url = new URL(req.url, 'http://127.0.0.1');
 
   try {
-    if (url.pathname === '/api/users' && req.method === 'GET') {
-      ensureUsersDir();
-      const users = fs.readdirSync(usersDir)
-        .filter((f) => f.endsWith('.json'))
-        .map((f) => {
-          try { return publicUser(JSON.parse(fs.readFileSync(path.join(usersDir, f), 'utf8'))); }
-          catch (e) { return null; }
-        })
-        .filter(Boolean);
-      send(res, 200, { users });
+    if (url.pathname === '/api/health' && req.method === 'GET') {
+      send(res, 200, { ok: true, storage: USE_GITHUB ? 'github' : 'local' });
       return;
     }
 
     if (url.pathname === '/api/register' && req.method === 'POST') {
       const body = await readBody(req);
-      // token is optional from the client; prefer body.token, then x-token header, otherwise generate one
-      const token = body.token || req.headers['x-token'] || crypto.randomUUID();
-      if (!userPath(body.id) || !body.passwordHash || !body.mobile || !body.name) {
+      if (!validId(body.id) || !body.passwordHash || !body.mobile || !body.name) {
         send(res, 400, { error: 'Mobile, name, and password are required.' });
         return;
       }
-      if (readUser(body.id)) {
+      if (await readUser(body.id)) {
         send(res, 409, { error: 'An account with that mobile and name already exists.' });
         return;
       }
@@ -118,27 +222,28 @@ const server = http.createServer(async (req, res) => {
         id: body.id,
         mobile: String(body.mobile || ''),
         name: String(body.name || ''),
-        passwordHash: body.passwordHash,
-        token: token,
+        token: crypto.randomUUID(),
         updatedAt: new Date().toISOString(),
-        progress: body.progress || {},
+        progress: body.progress && typeof body.progress === 'object' ? body.progress : {},
       };
-      writeUser(rec);
+      setPassword(rec, body.passwordHash);
+      await writeUser(rec, { now: true });
       send(res, 201, { ...publicUser(rec), token: rec.token, progress: rec.progress });
       return;
     }
 
     if (url.pathname === '/api/login' && req.method === 'POST') {
       const body = await readBody(req);
-      const rec = readUser(body.id);
-      if (!rec || rec.passwordHash !== body.passwordHash) {
+      const rec = await readUser(body.id);
+      if (!rec || !checkPassword(rec, body.passwordHash)) {
         send(res, 401, { error: 'Mobile, name, or password does not match a saved account.' });
         return;
       }
-      rec.token = body.token || req.headers['x-token'] || rec.token;
-      // update last-seen time on successful login
-      rec.updatedAt = new Date().toISOString();
-      writeUser(rec);
+      // keep the existing token so other signed-in devices stay signed in
+      let changed = false;
+      if (!rec.token) { rec.token = crypto.randomUUID(); changed = true; }
+      if (!rec.passwordSalt) { setPassword(rec, body.passwordHash); changed = true; }
+      if (changed) await writeUser(rec, { now: true });
       send(res, 200, { ...publicUser(rec), token: rec.token, progress: rec.progress || {} });
       return;
     }
@@ -146,12 +251,12 @@ const server = http.createServer(async (req, res) => {
     const userMatch = url.pathname.match(/^\/api\/users\/([^/]+)$/);
     if (userMatch) {
       const id = decodeURIComponent(userMatch[1]);
-      const rec = readUser(id);
+      const rec = await readUser(id);
       if (!rec) {
         send(res, 404, { error: 'No saved account with that name.' });
         return;
       }
-      if (req.headers['x-token'] !== rec.token) {
+      if (!rec.token || !sameText(req.headers['x-token'] || '', rec.token)) {
         send(res, 401, { error: 'Sign in again to update this account.' });
         return;
       }
@@ -167,40 +272,43 @@ const server = http.createServer(async (req, res) => {
           return;
         }
         rec.progress = nextProgress;
-        rec.updatedAt = body.updatedAt || new Date().toISOString();
-        writeUser(rec);
+        rec.updatedAt = new Date().toISOString();
+        await writeUser(rec);
         send(res, 200, { ok: true, id: rec.id, updatedAt: rec.updatedAt });
         return;
       }
     }
 
-    if (req.method === 'GET') {
-      let rel = decodeURIComponent(url.pathname);
-      if (rel === '/') rel = '/index.html';
-      if (rel.includes('..') || rel.startsWith('/users')) {
-        send(res, 404, { error: 'Not found' });
-        return;
-      }
-      // Ensure we join paths correctly even when rel starts with a leading slash
-      const relPath = rel.startsWith('/') ? rel.slice(1) : rel;
-      const file = path.join(root, relPath);
-      if (!file.startsWith(root) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
-        send(res, 404, { error: 'Not found' });
-        return;
-      }
-      const ext = path.extname(file);
-      res.writeHead(200, { 'Content-Type': TYPES[ext] || 'application/octet-stream' });
-      fs.createReadStream(file).pipe(res);
+    // The app is a single page; nothing else in this folder is served.
+    if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      fs.createReadStream(path.join(root, 'index.html')).pipe(res);
       return;
     }
 
     send(res, 404, { error: 'Not found' });
   } catch (err) {
+    console.error(err);
     send(res, 500, { error: err.message || 'Server error' });
   }
 });
 
-server.listen(PORT, '127.0.0.1', () => {
+// Write any batched progress to GitHub before the host stops the server.
+async function shutdown() {
+  await Promise.all([...pending.keys()].map((id) => flush(id)));
+  process.exit(0);
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+server.listen(PORT, HOST, () => {
   console.log('DSA tracker http://127.0.0.1:' + PORT);
-  console.log('Accounts save to ' + usersDir);
+  for (const addrs of Object.values(os.networkInterfaces())) {
+    for (const a of addrs || []) {
+      if (a.family === 'IPv4' && !a.internal) console.log('  on your network: http://' + a.address + ':' + PORT);
+    }
+  }
+  console.log(USE_GITHUB
+    ? 'Accounts save to github.com/' + GH_REPO + ' (' + GH_BRANCH + ') in ' + GH_DIR + '/'
+    : 'Accounts save to ' + usersDir);
 });
